@@ -142,14 +142,20 @@ mod slice_allocator {
 }
 
 struct Map<'a> {
+    small_strings: FxHashMap<[u8; 16], CityStats>,
     big_strings: FxHashMap<&'a [u8], CityStats>,
 }
 
 impl<'a> Map<'a> {
     fn new() -> Self {
+        let mut small_strings = FxHashMap::default();
+        small_strings.reserve(4 * 128);
         let mut big_strings = FxHashMap::default();
         big_strings.reserve(4 * 128);
-        Self { big_strings }
+        Self {
+            small_strings,
+            big_strings,
+        }
     }
 }
 
@@ -272,26 +278,55 @@ fn parse_chunk_and_record<'mmap, 'allocator, 'b>(
         chunk = remainder;
 
         // record entry
+        if name.len() <= 16 {
+            let mut n = [0u8; 16];
+            unsafe { n.get_unchecked_mut(0..name.len()).copy_from_slice(name) }
 
-        if let Some(entry) = map.big_strings.get_mut(name) {
-            entry.count += 1;
-            entry.sum += measurement as isize;
-            entry.min = entry.min.min(measurement);
-            entry.max = entry.max.max(measurement);
+            if let Some(entry) = map.small_strings.get_mut(&n) {
+                entry.count += 1;
+                entry.sum += measurement as isize;
+                entry.min = entry.min.min(measurement);
+                entry.max = entry.max.max(measurement);
+            } else {
+                // do short string path
+                if std::str::from_utf8(name).is_err() {
+                    return Err(());
+                }
+                map.small_strings.insert(n, CityStats::new(measurement));
+            }
         } else {
-            // TODO: additional name validations
-            if std::str::from_utf8(name).is_err() {
-                return Err(());
-            }
-            if current_slice.len() < name.len() {
-                current_slice = slice_allocator.alloc();
-            }
-            let (slot, rest) = current_slice.split_at_mut(name.len());
-            current_slice = rest;
-            slot.copy_from_slice(name);
+            if let Some(entry) = map.big_strings.get_mut(name) {
+                entry.count += 1;
+                entry.sum += measurement as isize;
+                entry.min = entry.min.min(measurement);
+                entry.max = entry.max.max(measurement);
+            } else {
+                // TODO: additional name validations
+                if std::str::from_utf8(name).is_err() {
+                    return Err(());
+                }
+                if current_slice.len() < name.len() {
+                    current_slice = slice_allocator.alloc();
+                }
+                let (slot, rest) = current_slice.split_at_mut(name.len());
+                current_slice = rest;
+                slot.copy_from_slice(name);
 
-            map.big_strings.insert(slot, CityStats::new(measurement));
+                map.big_strings.insert(slot, CityStats::new(measurement));
+            }
         }
+    }
+    for (bytes, stats) in map.small_strings.drain() {
+        let name_len = bytes.iter().position(|b| *b == 0).unwrap_or(16);
+        let name = unsafe { bytes.get_unchecked(..name_len) };
+        if current_slice.len() < name_len {
+            current_slice = slice_allocator.alloc();
+        }
+        let (slot, rest) = current_slice.split_at_mut(name_len);
+        current_slice = rest;
+        slot.copy_from_slice(name);
+
+        map.big_strings.insert(slot, stats);
     }
 
     Ok(())
