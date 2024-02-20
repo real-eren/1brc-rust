@@ -3,6 +3,7 @@
 use std::{
     collections::BTreeMap,
     fs::File,
+    hash::Hash,
     io::{BufWriter, Write},
     ops::Deref,
     ptr,
@@ -196,7 +197,7 @@ fn process<'a>(
 }
 
 struct Map<'a> {
-    small_strings: FxHashMap<[u8; 16], CityStats>,
+    small_strings: FxHashMap<ShortStr, CityStats>,
     big_strings: FxHashMap<&'a [u8], CityStats>,
 }
 
@@ -210,6 +211,21 @@ impl<'a> Map<'a> {
             small_strings,
             big_strings,
         }
+    }
+}
+
+#[derive(Eq, PartialEq)]
+struct ShortStr([u8; 16]);
+impl Hash for ShortStr {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        let ptr = self.0.as_ptr();
+        let word1 = unsafe { ptr.cast::<u64>().read_unaligned() };
+        let word2 = unsafe { ptr.byte_add(8).cast::<u64>().read_unaligned() };
+        state.write_u64(
+            (word1 ^ word2).wrapping_mul(0u64.wrapping_sub(6116868352871097435))
+                ^ (word1 >> 32)
+                ^ (word2 >> 16),
+        );
     }
 }
 
@@ -346,7 +362,6 @@ fn parse_next_line_guarded(chunk: &[u8]) -> Option<Result<ParsedRow, ()>> {
 /// Polls and increments `global_input_offset` for selecting a chunk.
 ///
 /// todo: If an error is encountered, it returns the location
-#[no_mangle]
 fn parse_and_record_unguarded_chunked<'mmap, 'allocator, 'b>(
     whole_input: &'mmap [u8],
     end_idx: usize,
@@ -358,6 +373,7 @@ fn parse_and_record_unguarded_chunked<'mmap, 'allocator, 'b>(
     /// Returns index of first newline in `slice`.
     /// Assumes slice contains a newline, otherwise will go out-of-bounds
     #[no_mangle]
+    #[inline(always)]
     unsafe fn find_next_newline_unguarded(slice: &[u8]) -> Result<usize, ()> {
         // want this code small, don't expect more than ~dozen iterations
         let mut p = slice.as_ptr();
@@ -454,7 +470,7 @@ fn parse_and_record_unguarded_chunked<'mmap, 'allocator, 'b>(
                     debug_assert_eq!(name, &n[..name.len()]);
                 }
 
-                if let Some(entry) = map.small_strings.get_mut(&n) {
+                if let Some(entry) = map.small_strings.get_mut(&ShortStr(n)) {
                     entry.count += 1;
                     entry.sum += measurement as isize;
                     entry.min = entry.min.min(measurement);
@@ -463,7 +479,8 @@ fn parse_and_record_unguarded_chunked<'mmap, 'allocator, 'b>(
                     if std::str::from_utf8(name).is_err() {
                         return Err(());
                     }
-                    map.small_strings.insert(n, CityStats::new(measurement));
+                    map.small_strings
+                        .insert(ShortStr(n), CityStats::new(measurement));
                 }
             } else {
                 if let Some(entry) = map.big_strings.get_mut(name) {
@@ -495,8 +512,8 @@ fn parse_and_record_unguarded_chunked<'mmap, 'allocator, 'b>(
     // move all the entries for cities with short names into the main map
     map.big_strings.reserve(map.small_strings.len());
     for (bytes, stats) in map.small_strings.drain() {
-        let name_len = bytes.iter().position(|b| *b == 0).unwrap_or(16);
-        let name = unsafe { bytes.get_unchecked(..name_len) };
+        let name_len = bytes.0.iter().position(|b| *b == 0).unwrap_or(16);
+        let name = unsafe { bytes.0.get_unchecked(..name_len) };
         if current_slice.len() < name_len {
             current_slice = slice_allocator.alloc();
         }
@@ -514,6 +531,7 @@ fn parse_and_record_unguarded_chunked<'mmap, 'allocator, 'b>(
 /// Assumes a newline will be found in chunk. Would read past end of `chunk` if that is not the
 /// case
 #[no_mangle]
+#[inline(always)]
 unsafe fn parse_next_line_unguarded(chunk: &[u8]) -> Result<ParsedRow, ()> {
     // record errors w/ this w/out branching
     let mut is_valid = true;
@@ -580,6 +598,7 @@ unsafe fn parse_next_line_unguarded(chunk: &[u8]) -> Result<ParsedRow, ()> {
 /// Optimized for matches in the first 16 bytes
 #[cfg(target_arch = "x86_64")]
 #[no_mangle]
+#[inline(always)]
 unsafe fn find_semicolon_unguarded(chunk: &[u8]) -> usize {
     use std::arch::x86_64::{_mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8};
     const SEMI_MASK: &[u8; 16] = &[b';'; 16];
