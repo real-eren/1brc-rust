@@ -426,11 +426,31 @@ fn parse_and_record_unguarded_chunked<'mmap, 'allocator, 'b>(
             // we do the lookup with the slice of the input, but store a slice in the
             // slice_allocator, so we can't use the entry API
             if name.len() <= 16 {
+                const NAME_MASKS: [[u8; 16]; 17] = {
+                    // i=0 -> all clear bits. i=1 -> first byte all set. i=16 -> all set bits
+                    let mut n = [[0u8; 16]; 17];
+                    let mut mask_idx = 0;
+                    while mask_idx < n.len() {
+                        let mut byte_idx = 0;
+                        // for mask n, the first n bytes are set
+                        while byte_idx < mask_idx {
+                            n[mask_idx][byte_idx] = 0xFFu8;
+                            byte_idx += 1;
+                        }
+                        mask_idx += 1;
+                    }
+                    n
+                };
+
                 // do short string path
                 let mut n = [0u8; 16];
                 unsafe {
-                    let dest = &mut n[..name.len()];
-                    std::ptr::copy_nonoverlapping(name.as_ptr(), dest.as_mut_ptr(), dest.len());
+                    use std::arch::x86_64::{_mm_and_si128, _mm_loadu_si128, _mm_storeu_si128};
+                    let bits = _mm_loadu_si128(name.as_ptr().cast());
+                    let mask =
+                        _mm_loadu_si128(NAME_MASKS.as_ptr().byte_add(16 * name.len()).cast());
+                    let masked_name = _mm_and_si128(bits, mask);
+                    _mm_storeu_si128(n.as_mut_ptr().cast(), masked_name);
                     debug_assert_eq!(name, &n[..name.len()]);
                 }
 
