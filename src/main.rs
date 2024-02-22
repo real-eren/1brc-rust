@@ -370,13 +370,17 @@ fn parse_and_record_unguarded_chunked<'mmap, 'allocator, 'b>(
     slice_allocator: &'allocator SliceAllocator,
     global_input_offset: &AtomicUsize,
 ) -> Result<(), ()> {
-    /// Returns index of first newline in `slice`.
-    /// Assumes slice contains a newline, otherwise will go out-of-bounds
+    /// Returns index of first newline in `slice` within 100-ish bytes, else Err.
+    /// Assumes slice is at least 106 bytes long, otherwise may go out-of-bounds
     #[no_mangle]
     #[inline(always)]
     unsafe fn find_next_newline_unguarded(slice: &[u8]) -> Result<usize, ()> {
         // want this code small, don't expect more than ~dozen iterations
+        // also, should be bounded (limit iterations) because we want to
+        // provide decent error times
+
         let mut p = slice.as_ptr();
+        // longest case: slice is start of line. 100 byte name + ';' + '-99.9' + '\n' = 106
         let mut num_steps_remaining = 100 + 1 + 5;
         while (num_steps_remaining != 0) & (std::ptr::read(p) != b'\n') {
             p = p.byte_add(1);
@@ -389,6 +393,7 @@ fn parse_and_record_unguarded_chunked<'mmap, 'allocator, 'b>(
             Ok(p as usize - slice.as_ptr() as usize)
         }
     }
+
     assert!(end_idx < whole_input.len());
 
     // `current_slice` acts as a bump allocator, whose memory is borrowed from, and preserved by, `slice_allocator`.
@@ -426,6 +431,7 @@ fn parse_and_record_unguarded_chunked<'mmap, 'allocator, 'b>(
         debug_assert_eq!(b'\n', whole_input[chunk_end], "end should point to newline");
 
         let mut remaining_input = unsafe { whole_input.get_unchecked((chunk_start + 1)..) };
+        // parse input up to this newline.
         let chunk_end = unsafe { whole_input.get_unchecked(chunk_end..) }.as_ptr();
 
         // now parse and records lines from the chunk
@@ -473,8 +479,12 @@ fn parse_and_record_unguarded_chunked<'mmap, 'allocator, 'b>(
                 if let Some(entry) = map.small_strings.get_mut(&ShortStr(n)) {
                     entry.count += 1;
                     entry.sum += measurement as isize;
-                    entry.min = entry.min.min(measurement);
-                    entry.max = entry.max.max(measurement);
+                    if measurement < entry.min {
+                        entry.min = measurement;
+                    }
+                    if measurement > entry.max {
+                        entry.max = measurement;
+                    }
                 } else {
                     if std::str::from_utf8(name).is_err() {
                         return Err(());
