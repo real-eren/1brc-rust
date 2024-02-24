@@ -2,6 +2,7 @@
 //! originally posed by Gunnar Morling for Java
 use std::{
     collections::BTreeMap,
+    fmt::Display,
     fs::File,
     hash::Hash,
     io::{BufWriter, Write},
@@ -22,73 +23,256 @@ fn is_newline(b: &u8) -> bool {
     *b == b'\n'
 }
 
-fn main() -> Result<(), std::io::Error> {
-    // todo: CLI args
-    let mut buffered_stdout = BufWriter::with_capacity(2 * 1024 * 1024, std::io::stdout());
-    let file = File::open("./measurements.txt")?;
-    let mmap = unsafe { MmapOptions::new().map(&file)? };
+const DEFAULT_STDOUT_BUFFER_CAPACITY: usize = 2 * 1024 * 1024;
+const MIN_STDOUT_BUFFER_CAPACITY: usize = 4 * 1024;
+const DEFAULT_CHUNK_SIZE: usize = 1 << 22;
+const MIN_CHUNK_SIZE: usize = 1 << 12;
+const DEFAULT_BACKING_SIZE: usize = 1 << 18;
+const MIN_BACKING_SIZE: usize = 1 << 12;
+const DEFAULT_PIECE_SIZE: usize = 1 << 13;
+const MIN_PIECE_SIZE: usize = 1 << 12;
 
-    let num_cores = if let Ok(n) = thread::available_parallelism() {
-        // todo: CLI option for numcores
+const HELP_TEXT: &str = "
+Form: {program} [--options ...] [input ...]
+
+    Passing inputs:
+Each value passed as 'input' will be treated as a file.
+One line of output will written to stdout for each input file, in order.
+
+    Options:
+--help                     | print this text
+
+--verbose                  | print configuration values to stderr before running
+
+--fail-early               | Exit after the first error while parsing. Default is to cancel that input and
+                             print a '-' in it's place, and continue with the other inputs as normal
+
+--threads={N}              | Max number of worker threads to use. Default auto-detect, else integer N >= 1
+                             ex: '-T=5'
+
+--stdout-buffer-size={N}.{UNIT}
+                           | Size of buffer for stdout.
+                             Default 64KB, else integer N where N is a multiple of 4KB.
+                             Unit is one of [KB, MB, GB]
+                             ex: '--stdout-buffer-size=1.MB' sets the chunk size to 1 megabyte
+
+--chunk-size={N}.{UNIT}    | Size of input assigned to a thread at one time.
+                             Default 4MB, else integer N where N is a multiple of 4KB.
+                             Unit is one of [KB, MB, GB]
+                             ex: '--chunk-size=16.MB' sets the chunk size to 16 megabytes
+
+--alloc-backing={N}.{UNIT} | Size used by slice allocator for malloc calls. NOT the maximum memory usage.
+                             A smaller value can reduce the excess memory that is reserved but not needed.
+                             Default 256KB, else integer N where N is a multiple of 4KB.
+                             A very large value will increase the excess memory usage of this program,
+                             while a very small value will result in more calls to the system allocator,
+                             likely slowing down the program slightly.
+                             Unit is one of [KB, MB, GB]
+                             ex: '--alloc-backing=16.KB' sets the backing buffer size to 16KB
+
+--alloc-piece={N}.{UNIT}   | Size of slice given by slice allocator to each thread upon request.
+                             A smaller value can reduce memory wasted per thread,
+                             though an excessively small value can lead to more internal fragmentation.
+                             It is an error if this value is greater than that passed to --alloc-backing
+                             Default 8KB, else integer N where N is a multiple of 4KB.
+                             Unit is one of [KB, MB, GB]
+                             ex: '--alloc-piece=80.KB' sets the sub buffer size to 80 KB
+";
+
+fn main() -> Result<(), std::io::Error> {
+    let mut num_cores = if let Ok(n) = thread::available_parallelism() {
         n.get()
     } else {
-        eprintln!("couldn't query the available parallelism, going single-threaded");
+        eprintln!("couldn't query the available parallelism, defaulting to single-threaded");
         1
     };
 
-    let parse_config = ParseConfig {
-        num_cores,
-        chunk_size: 4 * 1024 * 1024,
-    };
-    // todo: CLI opts for alloc config
+    let mut verbose = false;
+    let mut fail_early = false;
+    let mut chunk_size = DEFAULT_CHUNK_SIZE;
+    let mut backing_size = DEFAULT_BACKING_SIZE;
+    let mut given_size = DEFAULT_PIECE_SIZE;
+    let mut stdout_buffer_size = DEFAULT_STDOUT_BUFFER_CAPACITY;
+
+    // first arg is this command
+    let mut args = std::env::args().skip(1).collect::<Vec<_>>();
+    {
+        let mut exit_early = false;
+        args.retain(|arg| {
+            if exit_early {
+                return false;
+            }
+            let Some(option) = arg.strip_prefix("--") else { return true; };
+
+            // handle value-less options
+            match option {
+                "help" => {
+                    exit_early = true;
+                    return false;
+                }
+                "verbose" => {
+                    verbose = true;
+                    return false;
+                }
+                "fail-early" => {
+                    fail_early = true;
+                    return false;
+                }
+                _ => {}
+            }
+
+            // handle options with values. expect '='
+            let Some((option, value)) = option.split_once('=') else {
+                eprintln!("bad option: `{arg}`. Invalid formatting: options other than '--help' need a value, in the form of '--option=value', with no whitespace");
+                exit_early = true;
+                return false;
+            };
+
+            // handle options that have simple values
+            match option {
+                "threads" => {
+                    let Ok(n) = value.parse::<usize>() else {
+                        eprintln!("invalid number passed for --threads: '{value}'");
+                        exit_early = true;
+                        return false;
+                    };
+                    if !(1..256).contains(&n) {
+                        eprintln!("number of threads should be between 1 and 256. Got {n}.");
+                        exit_early = true;
+                        return false;
+                    }
+                    num_cores = n;
+                    return false;
+                }
+                _ => {}
+            }
+            // handle options that have value w/ unit
+            let Some((value, unit)) = value.split_once('.') else {
+                eprintln!("bad option: `{arg}`. Options other than 'threads' require a value in the form of '--option=1.KB");
+                exit_early = true;
+                return false;
+            };
+
+            let Ok(value) = value.parse::<u32>() else {
+                eprintln!("invalid number in {arg}");
+                exit_early = true;
+                return false;
+            };
+            let unit: usize = match unit.to_ascii_lowercase().as_str() {
+                "kb" => 1 << 10,
+                "mb" => 1 << 20,
+                "gb" => 1 << 30,
+                _ => {
+                    eprintln!("invalid unit {unit} in {arg}");
+                    exit_early = true;
+                    return false;
+                }
+            };
+            let value = value as usize * unit;
+            match option {
+                "stdout-buffer-size" => {
+                    if value % MIN_STDOUT_BUFFER_CAPACITY != 0 {
+                        eprintln!("In {arg}, value must be a multiple of {MIN_STDOUT_BUFFER_CAPACITY}");
+                        exit_early = true;
+                        return false;
+                    }
+                    stdout_buffer_size = value;
+                },
+                "chunk-size" => {
+                    if value % MIN_CHUNK_SIZE != 0 {
+                        eprintln!("In {arg}, value must be a multiple of {MIN_CHUNK_SIZE}");
+                        exit_early = true;
+                        return false;
+                    }
+                    chunk_size = value;
+                },
+                "alloc-backing" => {
+                    if value % MIN_BACKING_SIZE != 0 {
+                        eprintln!("In {arg}, value must be a multiple of {MIN_BACKING_SIZE}");
+                        exit_early = true;
+                        return false;
+                    }
+                    backing_size = value;
+                },
+                "alloc-piece" => {
+                    if value % MIN_PIECE_SIZE != 0 {
+                        eprintln!("In {arg}, value must be a multiple of {MIN_PIECE_SIZE}");
+                        exit_early = true;
+                        return false;
+                    }
+                    given_size = value;
+                },
+                _ => {
+                    eprintln!("invalid option {arg}");
+                    exit_early = true;
+                    return false;
+                }
+            }
+            false
+        });
+        if exit_early {
+            eprintln!("{HELP_TEXT}");
+            return Ok(());
+        }
+    }
+    if verbose {
+        eprintln!("fail_early: {fail_early}\nnum_cores: {num_cores}\nchunk_size: {chunk_size}\nbacking_size: {backing_size}\npiece_size: {given_size}\n");
+    }
+
     let alloc_config = AllocConfig {
-        backing_size: 64 * 4096,
-        given_size: 2 * 4096,
+        backing_size,
+        given_size,
     };
-    let slice: &[u8] = mmap.deref();
+    let mut backing_buffer_container = Vec::new();
+    let slice_allocator = SliceAllocator::new(&mut backing_buffer_container, alloc_config);
+    let mut maps = (0..num_cores).map(|_| Map::new()).collect::<Vec<Map>>();
 
-    // todo: handle multiple inputs
-    match process(slice, parse_config, alloc_config, &mut buffered_stdout) {
-        Ok(_) => {
-            writeln!(buffered_stdout).unwrap();
-            buffered_stdout.flush().unwrap();
-        }
-        Err(_) => {
-            // todo: diagnose error
-            println!("-");
-            eprintln!("encountered error while processing file _")
-        }
-    };
+    let mut buffered_stdout =
+        BufWriter::with_capacity(stdout_buffer_size, std::io::stdout().lock());
+
+    for file_name in args {
+        let file = File::open(&file_name)?;
+        let mmap = unsafe { MmapOptions::new().map(&file)? };
+        let input: &[u8] = mmap.deref();
+
+        unsafe { slice_allocator.clear() };
+        match process(
+            input,
+            chunk_size,
+            &mut maps,
+            &slice_allocator,
+            &mut buffered_stdout,
+        ) {
+            Ok(_) => {
+                writeln!(buffered_stdout).unwrap();
+                buffered_stdout.flush().unwrap();
+            }
+            Err(parse_error) => {
+                // print dash to keep 1:1 correspondence between input lines and output lines
+                println!("-");
+                eprintln!("encountered error while processing file {file_name}: {parse_error}");
+                if fail_early {
+                    return Err(std::io::Error::new(std::io::ErrorKind::Other, "Exiting early because a parsing error was encountered and '--fail-early' was passed"));
+                }
+            }
+        };
+    }
+
     Ok(())
-}
-
-#[derive(Clone, Copy)]
-struct ParseConfig {
-    /// Maximum number of cores
-    num_cores: usize,
-    /// Length of input each thread will examine at a time
-    chunk_size: usize,
 }
 
 /// Collects min, mean and max for each city, from lines in `input`,
 /// attempting to use up to `numCores`
 /// Stops parsing some time after an error is encountered, but before any writing output.
 /// Returns Err if any invalid input encountered during parsing, else Ok.
-fn process<'a>(
+fn process<'a, 'allocator>(
     input: &'a [u8],
-    parse_config: ParseConfig,
-    alloc_config: AllocConfig,
+    chunk_size: usize,
+    maps: &mut [Map<'allocator>],
+    slice_allocator: &'allocator SliceAllocator,
     out: &mut impl Write,
-) -> Result<(), ()> {
+) -> Result<(), ParseError<'a>> {
     // don't set up parallelization for small inputs
-    let num_cores = parse_config
-        .num_cores
-        .min(input.len() / parse_config.chunk_size)
-        .max(1);
-    // todo: take these in as parameters to re-use data structures for each input
-    let mut vecs = Vec::new();
-    let slice_allocator = SliceAllocator::new(&mut vecs, alloc_config);
-    let mut maps = (0..num_cores).map(|_| Map::new()).collect::<Vec<Map>>();
     let processing_error = Mutex::new(None);
     let mut global_input_idx = AtomicUsize::new(0);
 
@@ -105,13 +289,13 @@ fn process<'a>(
             let first_newline_pos = input[..FORWARD_SEARCH_LIMIT]
                 .iter()
                 .position(is_newline)
-                .ok_or(())?;
+                .ok_or(ParseError::new(input, ParseErrorKind::MissingNewlineFront))?;
             // find start of line before last 120 bytes,
             const END_PADDING_LENGTH: usize = 120;
             let end_start = 1 + input[..input.len() - END_PADDING_LENGTH]
                 .iter()
                 .rposition(is_newline)
-                .ok_or(())?;
+                .ok_or(ParseError::new(input, ParseErrorKind::MissingNewlineBack))?;
             parse_and_record_simple(&input[..first_newline_pos], map, slice_allocator)?;
             parse_and_record_simple(&input[end_start..], map, slice_allocator)?;
             (first_newline_pos + 1, end_start)
@@ -124,25 +308,38 @@ fn process<'a>(
         if *global_input_idx.get_mut() >= end_idx {
             return;
         }
-        for map in maps.iter_mut() {
+        // if the input is only a few chunks long, only start up that many threads
+        let max_num_threads = (input.len() + chunk_size - 1) / chunk_size;
+
+        let (first, rest) = maps.split_first_mut().expect("at least one threads");
+        for map in rest.iter_mut().take(max_num_threads - 1) {
             let sa = &slice_allocator;
             let pe = &processing_error;
             let gii = &global_input_idx;
             s.spawn(move || {
-                if let Err(e) = parse_and_record_unguarded_chunked(
-                    input,
-                    end_idx,
-                    parse_config.chunk_size,
-                    map,
-                    sa,
-                    gii,
-                ) {
+                if let Err(e) =
+                    parse_and_record_unguarded_chunked(input, end_idx, chunk_size, map, sa, gii)
+                {
                     pe.lock().unwrap().get_or_insert(e);
                     // let other threads know they should stop
                     gii.store(input.len(), std::sync::atomic::Ordering::SeqCst)
                 };
             });
         }
+
+        // don't need to spawn the last thread, just use the main thread
+        if let Err(e) = parse_and_record_unguarded_chunked(
+            input,
+            end_idx,
+            chunk_size,
+            first,
+            slice_allocator,
+            &global_input_idx,
+        ) {
+            processing_error.lock().unwrap().get_or_insert(e);
+            // let other threads know they should stop
+            global_input_idx.store(input.len(), std::sync::atomic::Ordering::SeqCst)
+        };
     }); // scope ends, all threads were joined
     if let Some(e) = processing_error.into_inner().unwrap() {
         return Err(e);
@@ -151,8 +348,8 @@ fn process<'a>(
     // maps are now populated with data from chunks of the mmap. Merge them.
     // invalid input would have been caught during parsing, so the code below cannot fail
     let mut sorted_long_results = BTreeMap::<&'a str, CityStats>::new();
-    for map in maps {
-        for (name, stats) in map.big_strings {
+    for map in maps.iter_mut() {
+        for (name, stats) in map.big_strings.drain() {
             sorted_long_results
                 // SAFETY: names are validated as utf8 during parse stage
                 .entry(unsafe { std::str::from_utf8_unchecked(name) })
@@ -214,8 +411,41 @@ impl<'a> Map<'a> {
     }
 }
 
+/// Struct for strings up to 16 bytes, padded with null bytes.
 #[derive(Eq, PartialEq)]
 struct ShortStr([u8; 16]);
+impl ShortStr {
+    /// First half all set, second half all clear
+    const NAME_MASKS: [u8; 32] = {
+        let mut n = [0u8; 32];
+        let mut mask_idx = 0;
+        while mask_idx < 16 {
+            n[mask_idx] = 0xFFu8;
+            mask_idx += 1;
+        }
+        n
+    };
+
+    /// Copy the first `len` bytes from `input` into a new [ShortStr]
+    /// Safety: name should point into an array at least 16 bytes long. len must be 16 or less
+    #[inline(always)]
+    #[no_mangle]
+    unsafe fn from_slice(input: &[u8], len: usize) -> Self {
+        debug_assert!(input.len() >= 16, "backing array should be ");
+        debug_assert!(len <= 16, "");
+        // do short string path
+        let mut n = [0u8; 16];
+        unsafe {
+            use std::arch::x86_64::{_mm_and_si128, _mm_loadu_si128, _mm_storeu_si128};
+            let bits = _mm_loadu_si128(input.as_ptr().cast());
+            let mask = _mm_loadu_si128(Self::NAME_MASKS.as_ptr().byte_add(16 - len).cast());
+            let masked_name = _mm_and_si128(bits, mask);
+            _mm_storeu_si128(n.as_mut_ptr().cast(), masked_name);
+            debug_assert_eq!(&input[..len], &n[..len]);
+        }
+        Self(n)
+    }
+}
 impl Hash for ShortStr {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         let ptr = self.0.as_ptr();
@@ -248,6 +478,56 @@ impl CityStats {
     }
 }
 
+#[derive(Clone, Copy)]
+pub struct ParseError<'input> {
+    /// The interpretation of this depends on the kind
+    input: &'input [u8],
+    kind: ParseErrorKind,
+}
+
+impl<'input> Display for ParseError<'input> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let input = self.input;
+        // todo: incorporate input in error message
+        match self.kind {
+            ParseErrorKind::BadMeasurement => {
+                writeln!(f, "bad measurement")
+            }
+            ParseErrorKind::BadName => {
+                writeln!(f, "bad city name")
+            }
+            ParseErrorKind::MissingSemicolon => {
+                writeln!(f, "missing semicolon")
+            }
+            ParseErrorKind::MissingNewline => {
+                writeln!(f, "missing newline")
+            }
+            ParseErrorKind::MissingNewlineFront => {
+                writeln!(f, "missing newline")
+            }
+            ParseErrorKind::MissingNewlineBack => {
+                writeln!(f, "missing newline")
+            }
+        }
+    }
+}
+
+impl<'input> ParseError<'input> {
+    pub fn new(input: &'input [u8], kind: ParseErrorKind) -> Self {
+        Self { input, kind }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub enum ParseErrorKind {
+    BadMeasurement,
+    BadName,
+    MissingSemicolon,
+    MissingNewline,
+    MissingNewlineFront,
+    MissingNewlineBack,
+}
+
 /// Naive implementation for the edges of large inputs or
 /// very small inputs that aren't worth spinning up threads for
 /// performs bounds checks
@@ -256,7 +536,7 @@ fn parse_and_record_simple<'mmap, 'allocator, 'b>(
     whole_input: &'mmap [u8],
     map: &'b mut Map<'allocator>,
     slice_allocator: &'allocator SliceAllocator,
-) -> Result<(), ()> {
+) -> Result<(), ParseError<'mmap>> {
     // `current_slice` acts as a bump allocator, whose memory is borrowed from, and preserved by, `slice_allocator`.
     let mut current_slice: &'allocator mut [u8] = &mut [];
     let mut chunk = whole_input;
@@ -280,7 +560,7 @@ fn parse_and_record_simple<'mmap, 'allocator, 'b>(
         } else {
             // TODO: additional name validations
             if std::str::from_utf8(name).is_err() {
-                return Err(());
+                return Err(ParseError::new(name, ParseErrorKind::BadName));
             }
             if current_slice.len() < name.len() {
                 current_slice = slice_allocator.alloc();
@@ -305,13 +585,16 @@ struct ParsedRow<'a> {
 
 /// Finds and parses the first line in chunk. If successful, returns name, measurement and remainder
 /// Not heavily optimized for speed
-fn parse_next_line_guarded(chunk: &[u8]) -> Option<Result<ParsedRow, ()>> {
+fn parse_next_line_guarded(chunk: &[u8]) -> Option<Result<ParsedRow, ParseError>> {
     if chunk.is_empty() {
         return None;
     }
     // "cityname;-12.1\n"
     let Some(semi_pos) = chunk.iter().position(|b| *b == b';') else {
-        return Some(Err(()));
+        return Some(Err(ParseError::new(
+            chunk,
+            ParseErrorKind::MissingSemicolon,
+        )));
     };
     let (name, rest) = chunk.split_at(semi_pos);
     // trim semi from rest (guaranteed to be present)
@@ -336,7 +619,7 @@ fn parse_next_line_guarded(chunk: &[u8]) -> Option<Result<ParsedRow, ()>> {
 
     let m_len = measurement.len();
     if (m_len < 3) | (4 < m_len) {
-        return Some(Err(()));
+        return Some(Err(ParseError::new(chunk, ParseErrorKind::BadMeasurement)));
     }
 
     let ones = (measurement[m_len - 1].wrapping_sub(b'0')) as i16;
@@ -348,7 +631,7 @@ fn parse_next_line_guarded(chunk: &[u8]) -> Option<Result<ParsedRow, ()>> {
 
     let v = sign * (ones + tens * 10 + hundreds * 100);
     if (ones.max(tens).max(hundreds) >= 10) | (measurement[m_len - 2] != b'.') {
-        return Some(Err(()));
+        return Some(Err(ParseError::new(chunk, ParseErrorKind::BadMeasurement)));
     };
 
     Some(Ok(ParsedRow {
@@ -360,8 +643,8 @@ fn parse_next_line_guarded(chunk: &[u8]) -> Option<Result<ParsedRow, ()>> {
 
 /// For each line in `chunk`, records into `map`
 /// Polls and increments `global_input_offset` for selecting a chunk.
-///
-/// todo: If an error is encountered, it returns the location
+#[inline(always)]
+#[no_mangle]
 fn parse_and_record_unguarded_chunked<'mmap, 'allocator, 'b>(
     whole_input: &'mmap [u8],
     end_idx: usize,
@@ -369,7 +652,7 @@ fn parse_and_record_unguarded_chunked<'mmap, 'allocator, 'b>(
     map: &'b mut Map<'allocator>,
     slice_allocator: &'allocator SliceAllocator,
     global_input_offset: &AtomicUsize,
-) -> Result<(), ()> {
+) -> Result<(), ParseError<'mmap>> {
     /// Returns index of first newline in `slice` within 100-ish bytes, else Err.
     /// Assumes slice is at least 106 bytes long, otherwise may go out-of-bounds
     #[no_mangle]
@@ -410,15 +693,21 @@ fn parse_and_record_unguarded_chunked<'mmap, 'allocator, 'b>(
         let initial_chunk_end = (initial_chunk_start + chunk_size).min(end_idx);
 
         // SAFETY: During process(), we set end_idx to be at least 120 bytes before end of input.
-        let Some((chunk_start, chunk_end)) = (unsafe {
+        let Ok(chunk_start) = (unsafe {
             find_next_newline_unguarded(whole_input.get_unchecked(initial_chunk_start..))
-                .ok()
-                .zip(
-                    find_next_newline_unguarded(whole_input.get_unchecked(initial_chunk_end..))
-                        .ok(),
-                )
         }) else {
-            return Err(());
+            return Err(ParseError::new(
+                &whole_input[initial_chunk_start..],
+                ParseErrorKind::MissingNewline,
+            ));
+        };
+        let Ok(chunk_end) = (unsafe {
+            find_next_newline_unguarded(whole_input.get_unchecked(initial_chunk_end..))
+        }) else {
+            return Err(ParseError::new(
+                &whole_input[initial_chunk_end..],
+                ParseErrorKind::MissingNewline,
+            ));
         };
         let (chunk_start, chunk_end) = (
             initial_chunk_start + chunk_start,
@@ -441,42 +730,20 @@ fn parse_and_record_unguarded_chunked<'mmap, 'allocator, 'b>(
                 name,
                 measurement,
                 remainder,
-            } = unsafe { parse_next_line_unguarded(remaining_input)? };
+            } = unsafe {
+                parse_next_line_unguarded(remaining_input)
+                    .map_err(|_| ParseError::new(remaining_input, ParseErrorKind::BadMeasurement))?
+            };
+            let old_chunk = remaining_input;
             remaining_input = remainder;
 
             // record entry, handle short strings (common case) separately for speed
             // we do the lookup with the slice of the input, but store a slice in the
             // slice_allocator, so we can't use the entry API
             if name.len() <= 16 {
-                const NAME_MASKS: [[u8; 16]; 17] = {
-                    // i=0 -> all clear bits. i=1 -> first byte all set. i=16 -> all set bits
-                    let mut n = [[0u8; 16]; 17];
-                    let mut mask_idx = 0;
-                    while mask_idx < n.len() {
-                        let mut byte_idx = 0;
-                        // for mask n, the first n bytes are set
-                        while byte_idx < mask_idx {
-                            n[mask_idx][byte_idx] = 0xFFu8;
-                            byte_idx += 1;
-                        }
-                        mask_idx += 1;
-                    }
-                    n
-                };
+                let short_name = unsafe { ShortStr::from_slice(old_chunk, name.len()) };
 
-                // do short string path
-                let mut n = [0u8; 16];
-                unsafe {
-                    use std::arch::x86_64::{_mm_and_si128, _mm_loadu_si128, _mm_storeu_si128};
-                    let bits = _mm_loadu_si128(name.as_ptr().cast());
-                    let mask =
-                        _mm_loadu_si128(NAME_MASKS.as_ptr().byte_add(16 * name.len()).cast());
-                    let masked_name = _mm_and_si128(bits, mask);
-                    _mm_storeu_si128(n.as_mut_ptr().cast(), masked_name);
-                    debug_assert_eq!(name, &n[..name.len()]);
-                }
-
-                if let Some(entry) = map.small_strings.get_mut(&ShortStr(n)) {
+                if let Some(entry) = map.small_strings.get_mut(&short_name) {
                     entry.count += 1;
                     entry.sum += measurement as isize;
                     if measurement < entry.min {
@@ -487,10 +754,10 @@ fn parse_and_record_unguarded_chunked<'mmap, 'allocator, 'b>(
                     }
                 } else {
                     if std::str::from_utf8(name).is_err() {
-                        return Err(());
+                        return Err(ParseError::new(name, ParseErrorKind::BadName));
                     }
                     map.small_strings
-                        .insert(ShortStr(n), CityStats::new(measurement));
+                        .insert(short_name, CityStats::new(measurement));
                 }
             } else {
                 if let Some(entry) = map.big_strings.get_mut(name) {
@@ -504,7 +771,7 @@ fn parse_and_record_unguarded_chunked<'mmap, 'allocator, 'b>(
                         || name.contains(&b'\n')
                         || name.contains(&b';')
                     {
-                        return Err(());
+                        return Err(ParseError::new(name, ParseErrorKind::BadName));
                     }
                     if current_slice.len() < name.len() {
                         current_slice = slice_allocator.alloc();
@@ -646,7 +913,7 @@ fn find_byte_in_word(word: u64, byte: u8) -> (usize, bool) {
     } else {
         masked.trailing_zeros()
     }) / 8;
-    let has_byte = (masked != 0) as bool;
+    let has_byte = masked != 0;
     debug_assert!(lowest_idx <= 8, "index should be between 0 and 8");
     (lowest_idx as usize, has_byte)
 }
@@ -695,13 +962,16 @@ mod slice_allocator {
             self.m.lock().unwrap().alloc()
         }
 
-        /// TODO: verify that this can't be mis-used - i.e. clearing the buffer while references still
-        /// exist
-        pub unsafe fn _clear(mut self) -> Self {
-            let this = self.m.get_mut().unwrap();
+        /// Reset the state of this allocator
+        /// SAFETY: if there are any remaining references when calling this method, they will dangle.
+        /// That could be avoided by making this take a mut ref, but then we'd have to throw away
+        /// the map whose entries reference this slice. Kind of annoying since we know pretty
+        /// clearly what we want to do - re-use buffers over the list of files to process.
+        /// But RAII and borrow-checking adds some artificial complexity there.
+        pub unsafe fn clear(&self) {
+            let mut this = self.m.lock().unwrap();
             this.buffer_idx = 0;
             this.current_buffer = &mut [];
-            self
         }
     }
 
@@ -731,7 +1001,7 @@ mod slice_allocator {
                 slice_len >= self.config.given_size,
                 "about to return a slice shorter than requested"
             );
-            let buffer = mem::replace(&mut self.current_buffer, &mut []);
+            let buffer = mem::take(&mut self.current_buffer);
             let (give, keep) = buffer.split_at_mut(slice_len);
             self.current_buffer = keep;
             give
@@ -782,7 +1052,9 @@ mod test {
 
     use crate::{
         find_byte_in_word, find_semicolon_unguarded, parse_next_line_guarded,
-        parse_next_line_unguarded, process, slice_allocator::AllocConfig, ParseConfig, ParsedRow,
+        parse_next_line_unguarded, process,
+        slice_allocator::{self, AllocConfig},
+        Map, ParsedRow,
     };
 
     #[test]
@@ -870,10 +1142,6 @@ mod test {
 
     #[test]
     fn process_short() {
-        let parse_config = ParseConfig {
-            num_cores: 1,
-            chunk_size: 1024,
-        };
         let alloc_config = AllocConfig {
             backing_size: 64 * 4096,
             given_size: 2 * 4096,
@@ -887,7 +1155,10 @@ mod test {
         ] {
             let mut out = Vec::<u8>::with_capacity(1024);
             let mut buf_out = BufWriter::with_capacity(1024, &mut out);
-            let process = process(input.as_bytes(), parse_config, alloc_config, &mut buf_out);
+            let mut backing_buffer_container = Vec::new();
+            let slice_allocator = slice_allocator::SliceAllocator::new(&mut backing_buffer_container, alloc_config);
+            let mut maps = (0..1).map(|_| Map::new()).collect::<Vec<_>>();
+            let process = process(input.as_bytes(), 1024, &mut maps, &slice_allocator, &mut buf_out);
             assert!(
                 process.is_ok(),
                 "shouldn't encounter error, was given valid input: `{input}`"
@@ -905,10 +1176,6 @@ mod test {
 
     #[test]
     fn process_long_string() {
-        let parse_config = ParseConfig {
-            num_cores: 1,
-            chunk_size: 1024,
-        };
         let alloc_config = AllocConfig {
             backing_size: 64 * 4096,
             given_size: 2 * 4096,
@@ -917,7 +1184,17 @@ mod test {
             let input = input_base.repeat(1000);
             let mut out = Vec::<u8>::with_capacity(1024);
             let mut buf_out = BufWriter::with_capacity(1024, &mut out);
-            let process = process(input.as_bytes(), parse_config, alloc_config, &mut buf_out);
+            let mut backing_buffer_container = Vec::new();
+            let slice_allocator =
+                slice_allocator::SliceAllocator::new(&mut backing_buffer_container, alloc_config);
+            let mut maps = (0..1).map(|_| Map::new()).collect::<Vec<Map>>();
+            let process = process(
+                input.as_bytes(),
+                1024,
+                &mut maps,
+                &slice_allocator,
+                &mut buf_out,
+            );
             assert!(
                 process.is_ok(),
                 "shouldn't encounter error, was given valid input #{idx}"
