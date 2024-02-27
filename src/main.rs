@@ -2,7 +2,6 @@
 //! originally posed by Gunnar Morling for Java
 use std::{
     collections::BTreeMap,
-    fmt::Display,
     fs::File,
     hash::Hash,
     io::{BufWriter, Write},
@@ -48,11 +47,11 @@ One line of output will written to stdout for each input file, in order.
                              print a '-' in it's place, and continue with the other inputs as normal
 
 --threads={N}              | Max number of worker threads to use. Default auto-detect, else integer N >= 1
-                             ex: '-T=5'
+                             ex: '--threads=5'
 
 --stdout-buffer-size={N}.{UNIT}
                            | Size of buffer for stdout.
-                             Default 64KB, else integer N where N is a multiple of 4KB.
+                             Default 2MB, else integer N where N is a multiple of 4KB.
                              Unit is one of [KB, MB, GB]
                              ex: '--stdout-buffer-size=1.MB' sets the chunk size to 1 megabyte
 
@@ -248,9 +247,45 @@ fn main() -> Result<(), std::io::Error> {
                 buffered_stdout.flush().unwrap();
             }
             Err(parse_error) => {
+                let input_start_offset =
+                    unsafe { parse_error.input.as_ptr().byte_offset_from(input.as_ptr()) } as usize;
+                let semi_pos = parse_error.input.iter().position(|b| *b == b';').unwrap();
+                let (start_position, end_position) = match parse_error.kind {
+                    ParseErrorKind::BadMeasurement => {
+                        // between ";_____" or
+                        (
+                            input_start_offset + semi_pos,
+                            input_start_offset
+                                + (parse_error.input.len() - semi_pos).min(semi_pos + 6),
+                        )
+                    }
+                    ParseErrorKind::BadName => {
+                        let start = input_start_offset;
+                        let end = start + semi_pos;
+                        (start, end)
+                    }
+                    ParseErrorKind::MissingSemicolon => (
+                        input_start_offset,
+                        input.len().min(input_start_offset + 100),
+                    ),
+                    ParseErrorKind::MissingNewline => {
+                        (input_start_offset, input_start_offset + 106)
+                    }
+                    ParseErrorKind::MissingNewlineFront => (0, input.len().min(100)),
+                    ParseErrorKind::MissingNewlineBack => {
+                        let end = input_start_offset + parse_error.input.len();
+                        let start = end - 106;
+                        (start, end)
+                    }
+                };
                 // print dash to keep 1:1 correspondence between input lines and output lines
                 println!("-");
-                eprintln!("encountered error while processing file {file_name}: {parse_error}");
+                eprintln!(
+                    "encountered error while processing file {file_name}: {} near bytes {} to {}",
+                    parse_error.kind.message(),
+                    start_position,
+                    end_position
+                );
                 if fail_early {
                     return Err(std::io::Error::new(std::io::ErrorKind::Other, "Exiting early because a parsing error was encountered and '--fail-early' was passed"));
                 }
@@ -431,19 +466,21 @@ impl ShortStr {
     #[inline(always)]
     #[no_mangle]
     unsafe fn from_slice(input: &[u8], len: usize) -> Self {
-        debug_assert!(input.len() >= 16, "backing array should be ");
-        debug_assert!(len <= 16, "");
+        use std::arch::x86_64::{__m128i, _mm_and_si128, _mm_loadu_si128};
+        debug_assert!(
+            input.len() >= 16,
+            "backing array should be at least 16 bytes long"
+        );
+        debug_assert!(len <= 16);
         // do short string path
-        let mut n = [0u8; 16];
-        unsafe {
-            use std::arch::x86_64::{_mm_and_si128, _mm_loadu_si128, _mm_storeu_si128};
+        let padded_name = unsafe {
             let bits = _mm_loadu_si128(input.as_ptr().cast());
             let mask = _mm_loadu_si128(Self::NAME_MASKS.as_ptr().byte_add(16 - len).cast());
-            let masked_name = _mm_and_si128(bits, mask);
-            _mm_storeu_si128(n.as_mut_ptr().cast(), masked_name);
-            debug_assert_eq!(&input[..len], &n[..len]);
-        }
-        Self(n)
+            std::mem::transmute::<__m128i, [u8; 16]>(_mm_and_si128(bits, mask))
+        };
+        debug_assert_eq!(&input[..len], &padded_name[..len]);
+
+        Self(padded_name)
     }
 }
 impl Hash for ShortStr {
@@ -485,33 +522,6 @@ pub struct ParseError<'input> {
     kind: ParseErrorKind,
 }
 
-impl<'input> Display for ParseError<'input> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let input = self.input;
-        // todo: incorporate input in error message
-        match self.kind {
-            ParseErrorKind::BadMeasurement => {
-                writeln!(f, "bad measurement")
-            }
-            ParseErrorKind::BadName => {
-                writeln!(f, "bad city name")
-            }
-            ParseErrorKind::MissingSemicolon => {
-                writeln!(f, "missing semicolon")
-            }
-            ParseErrorKind::MissingNewline => {
-                writeln!(f, "missing newline")
-            }
-            ParseErrorKind::MissingNewlineFront => {
-                writeln!(f, "missing newline")
-            }
-            ParseErrorKind::MissingNewlineBack => {
-                writeln!(f, "missing newline")
-            }
-        }
-    }
-}
-
 impl<'input> ParseError<'input> {
     pub fn new(input: &'input [u8], kind: ParseErrorKind) -> Self {
         Self { input, kind }
@@ -526,6 +536,33 @@ pub enum ParseErrorKind {
     MissingNewline,
     MissingNewlineFront,
     MissingNewlineBack,
+}
+
+impl ParseErrorKind {
+    /// User-facing description
+    pub fn message(&self) -> &'static str {
+        match self {
+            ParseErrorKind::BadMeasurement => "bad measurement",
+            ParseErrorKind::BadName => "bad city name",
+            ParseErrorKind::MissingSemicolon => "missing semicolon",
+            ParseErrorKind::MissingNewline
+            | ParseErrorKind::MissingNewlineFront
+            | ParseErrorKind::MissingNewlineBack => "missing newline",
+        }
+    }
+}
+
+/// Returns true if `name` is a valid name.
+/// A valid name satisfies the following criteria:
+/// - Valid UTF8
+/// - no null bytes, newlines or semicolons
+fn validate_name(name: &[u8]) -> bool {
+    // common case is that all conditions pass
+    (1..101).contains(&name.len())
+        & std::str::from_utf8(name).is_ok()
+        & !name.contains(&b'\n')
+        & !name.contains(&b';')
+        & !name.contains(&0)
 }
 
 /// Naive implementation for the edges of large inputs or
@@ -558,8 +595,7 @@ fn parse_and_record_simple<'mmap, 'allocator, 'b>(
             entry.min = entry.min.min(measurement);
             entry.max = entry.max.max(measurement);
         } else {
-            // TODO: additional name validations
-            if std::str::from_utf8(name).is_err() {
+            if !validate_name(name) {
                 return Err(ParseError::new(name, ParseErrorKind::BadName));
             }
             if current_slice.len() < name.len() {
@@ -753,7 +789,7 @@ fn parse_and_record_unguarded_chunked<'mmap, 'allocator, 'b>(
                         entry.max = measurement;
                     }
                 } else {
-                    if std::str::from_utf8(name).is_err() {
+                    if !validate_name(name) {
                         return Err(ParseError::new(name, ParseErrorKind::BadName));
                     }
                     map.small_strings
@@ -766,11 +802,7 @@ fn parse_and_record_unguarded_chunked<'mmap, 'allocator, 'b>(
                     entry.min = entry.min.min(measurement);
                     entry.max = entry.max.max(measurement);
                 } else {
-                    // TODO: additional name validations
-                    if std::str::from_utf8(name).is_err()
-                        || name.contains(&b'\n')
-                        || name.contains(&b';')
-                    {
+                    if !validate_name(name) {
                         return Err(ParseError::new(name, ParseErrorKind::BadName));
                     }
                     if current_slice.len() < name.len() {
@@ -807,6 +839,7 @@ fn parse_and_record_unguarded_chunked<'mmap, 'allocator, 'b>(
 /// Finds and parses the first line in chunk. If successful, returns name, measurement and remainder
 /// Assumes a newline will be found in chunk. Would read past end of `chunk` if that is not the
 /// case
+/// Does not validate the name length
 #[no_mangle]
 #[inline(always)]
 unsafe fn parse_next_line_unguarded(chunk: &[u8]) -> Result<ParsedRow, ()> {
@@ -825,10 +858,10 @@ unsafe fn parse_next_line_unguarded(chunk: &[u8]) -> Result<ParsedRow, ()> {
     is_valid &= was_present;
     // we've recorded whether the newline was range, now make sure the index is safe
     // lowest valid value is 3: "1.2\n"
+    // if it was in fact too short, the character checks later will catch it.
     let newline_pos = newline_pos.max(3);
 
     let mut measurement = rest.get_unchecked(..newline_pos);
-    debug_assert!(!was_present || !measurement.ends_with(&[b'\n']),);
     let remainder = rest.get_unchecked((newline_pos + 1)..);
 
     let mut sign = 1i16;
@@ -903,10 +936,8 @@ unsafe fn find_semicolon_unguarded(chunk: &[u8]) -> usize {
 }
 
 #[inline(always)]
-fn find_byte_in_word(word: u64, byte: u8) -> (usize, bool) {
-    let masked = word ^ (0x0101_0101_0101_0101u64.wrapping_mul(byte as u64));
-    let masked =
-        (masked.wrapping_sub(0x0101_0101_0101_0101u64)) & !masked & 0x8080_8080_8080_8080u64;
+fn find_zero_byte_in_word(word: u64) -> (usize, bool) {
+    let masked = (word.wrapping_sub(0x0101_0101_0101_0101u64)) & !word & 0x8080_8080_8080_8080u64;
     // the high bit of each matching byte would be set, all other bits are 0
     let lowest_idx = (if masked == 0 {
         64 // ctz returns 64 if no set bit. This is actually less work w/ ctz
@@ -916,6 +947,11 @@ fn find_byte_in_word(word: u64, byte: u8) -> (usize, bool) {
     let has_byte = masked != 0;
     debug_assert!(lowest_idx <= 8, "index should be between 0 and 8");
     (lowest_idx as usize, has_byte)
+}
+#[inline(always)]
+fn find_byte_in_word(word: u64, byte: u8) -> (usize, bool) {
+    let masked = word ^ (0x0101_0101_0101_0101u64.wrapping_mul(byte as u64));
+    find_zero_byte_in_word(masked)
 }
 
 /// A small API to provide bump allocation for byte slices
@@ -1054,7 +1090,7 @@ mod test {
         find_byte_in_word, find_semicolon_unguarded, parse_next_line_guarded,
         parse_next_line_unguarded, process,
         slice_allocator::{self, AllocConfig},
-        Map, ParsedRow,
+        validate_name, Map, ParsedRow,
     };
 
     #[test]
@@ -1084,7 +1120,14 @@ mod test {
 
     #[test]
     fn find_semicolon_unguarded_test() {
-        for (input, exp_idx) in [(b";123456701234567" as &[u8], 0), (b"0;23456701234567", 1)] {
+        for (input, exp_idx) in [
+            (b";123456701234567" as &[u8], 0),
+            (b"0;23456701234567", 1),
+            (b"0123;56701234567", 4),
+            (b"012345678901234;", 15),
+            (b"0123456789012345;", 16),
+            (b"01234567890123456;", 17),
+        ] {
             assert!(
                 input.len() >= 16,
                 "invalid input. fn expects at least 16 bytes"
@@ -1094,7 +1137,7 @@ mod test {
     }
 
     #[test]
-    fn parse_unguarded() {
+    fn parse_unguarded_valid() {
         for (input, exp_name, exp_measurement, exp_remainder) in [
             ("a;12.3\nqwert12345qwert", "a", 123, "qwert12345qwert"),
             ("a@fj39. ;-1.1\nqwert12345", "a@fj39. ", -11, "qwert12345"),
@@ -1111,7 +1154,47 @@ mod test {
     }
 
     #[test]
-    fn parse_guarded_single_lines() {
+    fn validate_name_invalid_names() {
+        for (idx, name) in [b"\0", b"\n", b";"].into_iter().enumerate() {
+            assert!(
+                !validate_name(name),
+                "input #{idx} should have been detected as invalid"
+            )
+        }
+    }
+
+    /// Enough bytes after the error to be safe for the unguarded parse functions
+    const INVALID_PARSE_LINES_LONG: &[&str] = &[
+        "qwert12345qwert12345\n;qwert12345qwert\n",
+        "qwert12345qwert;\nabcdefghi",
+        "q;1\nqwert12345qwert",
+        "q;1.\nqwert12345qwert",
+        "q;.1\nqwert12345qwert",
+        "q;.11\nqwert12345qwert",
+        "q;11\nqwert12345qwert",
+        "q;123\nqwert12345qwert",
+        "q;11.\nqwert12345qwert",
+        "q;11.11\nqwert12345qwert",
+        "q;1,1\nqwert12345qwert",
+        "q;1_1\nqwert12345qwert",
+        "q;a.1\nqwert12345qwert",
+        "q;a.1\nqwert12345qwert",
+        "q;2.:\nqwert12345qwert",
+        "q;3/.3\nqwert12345qwert",
+    ];
+
+    #[test]
+    fn parse_unguarded_invalid() {
+        for input in INVALID_PARSE_LINES_LONG {
+            assert!(
+                unsafe { parse_next_line_unguarded(input.as_bytes()).is_err() },
+                "should have found error in {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_guarded_valid_single_lines() {
         for (input, exp_name, exp_measurement) in [
             ("city;12.3", b"city" as &[u8], 123),
             ("c;-1.0", b"c", -10),
@@ -1137,6 +1220,24 @@ mod test {
                 exp_measurement, measurement,
                 "parsing produced wrong number"
             );
+        }
+    }
+
+    const INVALID_PARSE_LINES_SHORT: &[&str] =
+        &["\n", ";", "a", "a;", "\na;12", "a;a;a", "abc;a.2\n"];
+
+    #[test]
+    fn parse_guarded_invalid_long() {
+        // guarded has to handle long and short lines
+        for input in INVALID_PARSE_LINES_LONG
+            .iter()
+            .chain(INVALID_PARSE_LINES_SHORT)
+        {
+            let parse_next_line_guarded = parse_next_line_guarded(input.as_bytes());
+            assert!(
+                parse_next_line_guarded.is_some_and(|r| r.is_err()),
+                "should have found error in {input}"
+            )
         }
     }
 
@@ -1180,7 +1281,16 @@ mod test {
             backing_size: 64 * 4096,
             given_size: 2 * 4096,
         };
-        for (idx, (input_base, exp_out)) in [("a;1.1\n", "{a=1.1/1.1/1.1}")].iter().enumerate() {
+        for (idx, (input_base, exp_out)) in [
+            ("a;1.1\n", "{a=1.1/1.1/1.1}"),
+            (
+                "abc;1.2\nqwert12345qwert12345;-9.5\nabc;10.0\nqwert12345qwert12345;-9.1\n",
+                "{abc=1.2/5.6/10.0, qwert12345qwert12345=-9.5/-9.3/-9.1}",
+            ),
+        ]
+        .iter()
+        .enumerate()
+        {
             let input = input_base.repeat(1000);
             let mut out = Vec::<u8>::with_capacity(1024);
             let mut buf_out = BufWriter::with_capacity(1024, &mut out);
